@@ -1,274 +1,250 @@
-import os
-from typing import List, Optional, Dict
-from dotenv import load_dotenv
+import os, re, uuid
+from typing import Optional, List
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import re
+from typing import List
 
-import numpy as np
-import faiss
 
-from sentence_transformers import SentenceTransformer
-from rank_bm25 import BM25Okapi
-from underthesea import sent_tokenize
-
-from openai import OpenAI
-
-# ================= CONFIG =================
 load_dotenv()
 
-EMBED_MODEL_PATH = "models/vietnamese-sbert"
+# ── Config ────────────────────────────────────────────────────────────────────
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "keepitreal/vietnamese-sbert")
+MODEL_CACHE_DIR  = os.getenv("MODEL_CACHE_DIR", os.path.join(os.path.dirname(__file__), "models"))
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-STUDENT_ID = os.getenv("STUDENT_ID", "B22DCAT082")
+# Proxy LLM theo slide: dùng MSSV làm API key
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://192.168.50.218:8000/api/v1/proxy")
+LLM_MODEL    = os.getenv("LLM_MODEL", "gpt-4o-mini")
+STUDENT_ID   = os.getenv("STUDENT_ID", "B22DCAT082")  # MSSV — dùng làm API key
 
-TOP_K = 20
-FINAL_K = 5
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", 512))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 32))
+TOP_K         = int(os.getenv("TOP_K", 5))
 
-PARENT_SIZE = 2000
-CHILD_SIZE = 500
-CHILD_OVERLAP = 100
+# Khi chạy offline (trong LAN thi), buộc transformers/HF KHÔNG gọi mạng.
+# Model phải đã được tải sẵn vào MODEL_CACHE_DIR (chạy download_model.py trước).
+if os.getenv("OFFLINE", "0") == "1":
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
-DENSE_WEIGHT = 0.7
-BM25_WEIGHT = 0.3
+# ── Embedding setup ───────────────────────────────────────────────────────────
+from sentence_transformers import SentenceTransformer
 
-# ================= MODEL =================
-model = SentenceTransformer(EMBED_MODEL_PATH)
+os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+_st_model = SentenceTransformer(EMBED_MODEL_NAME, cache_folder=MODEL_CACHE_DIR)
 
-def embed(texts: List[str]) -> np.ndarray:
-    vecs = model.encode(texts, convert_to_numpy=True)
-    vecs = vecs.astype("float32")
-    faiss.normalize_L2(vecs)
-    return vecs
+def get_embeddings(texts: List[str]) -> List[List[float]]:
+    return _st_model.encode(texts, convert_to_numpy=True).tolist()
 
-EMBED_DIM = model.get_sentence_embedding_dimension()
-print("[embed] dim:", EMBED_DIM)
+EMBED_DIM = _st_model.get_sentence_embedding_dimension()
+print(f"[embed] local — {EMBED_MODEL_NAME}  dim={EMBED_DIM}")
 
-# ================= FAISS =================
-base_index = faiss.IndexFlatIP(EMBED_DIM)
-index = faiss.IndexIDMap(base_index)
+# ── Vector store (FAISS in-memory) ───────────────────────────────────────────
+import faiss, numpy as np
 
-# ================= STORAGE =================
-chunk_store: Dict[int, str] = {}
-chunk_parent_map: Dict[int, int] = {}
-parent_map: Dict[int, str] = {}
+_index = faiss.IndexIDMap2(faiss.IndexFlatIP(EMBED_DIM))
+_store: dict[str, str] = {}   # chunk_id -> text
+_id_list: list[str] = []
 
-bm25 = None
-bm25_chunks: List[str] = []
+def db_upsert(chunk_id: str, vector: List[float], text: str):
+    vec = np.array([vector], dtype="float32")
+    faiss.normalize_L2(vec)
 
-# ================= RESET =================
-def reset_db():
-    global index, base_index, chunk_store, chunk_parent_map, parent_map, bm25, bm25_chunks
+    faiss_id = len(_id_list)  # or hash-based ID
+    _id_list.append(chunk_id)
+    _store[chunk_id] = text
 
-    base_index = faiss.IndexFlatIP(EMBED_DIM)
-    index = faiss.IndexIDMap(base_index)
+    _index.add_with_ids(vec, np.array([faiss_id], dtype=np.int64))
 
-    chunk_store = {}
-    chunk_parent_map = {}
-    parent_map = {}
+def db_search(vector: List[float], k: int) -> List[dict]:
+    if _index.ntotal == 0:
+        return []
 
-    bm25 = None
-    bm25_chunks = []
+    vec = np.array([vector], dtype="float32")
+    faiss.normalize_L2(vec)  # IMPORTANT
 
-# ================= CHUNKING =================
-def build_parents(text: str) -> List[str]:
-    sents = sent_tokenize(text)
+    _, idxs = _index.search(vec, min(k, _index.ntotal))
 
-    parents = []
-    cur = ""
+    return [
+        {"chunk_id": _id_list[i], "text": _store[_id_list[i]]}
+        for i in idxs[0] if i < len(_id_list)
+    ]
 
-    for s in sents:
-        if len(cur) + len(s) < PARENT_SIZE:
-            cur += " " + s
-        else:
-            parents.append(cur.strip())
-            cur = s
+def db_count() -> int:
+    return _index.ntotal
 
-    if cur:
-        parents.append(cur.strip())
+def db_reset():
+    global _index, _store, _id_list
+    _index = faiss.IndexIDMap2(faiss.IndexFlatIP(EMBED_DIM))
+    _store = {}
+    _id_list = []
+    
+print("[db] FAISS in-memory")
 
-    return parents
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="RAG Competition — Student Server")
 
-
-def build_children(parent: str) -> List[str]:
-    chunks = []
-    start = 0
-
-    while start < len(parent):
-        chunks.append(parent[start:start + CHILD_SIZE])
-        start += (CHILD_SIZE - CHILD_OVERLAP)
-
-    return chunks
-
-# ================= ADD =================
-def add_chunk(vec: np.ndarray, text: str, chunk_id: int, parent_id: int):
-    index.add_with_ids(vec, np.array([chunk_id], dtype="int64"))
-
-    chunk_store[chunk_id] = text
-    chunk_parent_map[chunk_id] = parent_id
-
-# ================= BM25 =================
-def build_bm25():
-    global bm25
-    tokenized = [c.split() for c in bm25_chunks]
-    bm25 = BM25Okapi(tokenized)
-
-# ================= INDEX BUILD =================
-def build_index(text: str):
-    reset_db()
-
-    parents = build_parents(text)
-
-    global bm25_chunks
-
-    for pid, p in enumerate(parents):
-        parent_map[pid] = p
-
-        children = build_children(p)
-
-        for c in children:
-            vec = embed([c])[0]
-
-            cid = len(chunk_store)
-            add_chunk(vec, c, cid, pid)
-
-            bm25_chunks.append(c)
-
-    build_bm25()
-
-# ================= SEARCH =================
-def dense_search(query: str):
-    vec = embed([query])
-    scores, ids = index.search(vec, TOP_K)
-
-    results = []
-    for s, i in zip(scores[0], ids[0]):
-        if i == -1:
-            continue
-        results.append((int(i), float(s)))
-    return results
-
-
-def bm25_search(query: str):
-    scores = bm25.get_scores(query.split())
-
-    results = []
-    for i, s in enumerate(scores):
-        results.append((i, float(s)))
-
-    return sorted(results, key=lambda x: x[1], reverse=True)[:TOP_K]
-
-
-def hybrid_search(question: str):
-    score_map = {}
-
-    # dense
-    for idx, score in dense_search(question):
-        score_map[idx] = score_map.get(idx, 0) + DENSE_WEIGHT * score
-
-    # bm25
-    for idx, score in bm25_search(question):
-        score_map[idx] = score_map.get(idx, 0) + BM25_WEIGHT * score
-
-    return sorted(score_map.items(), key=lambda x: x[1], reverse=True)[:TOP_K]
-
-# ================= RETRIEVAL =================
-def retrieve(question: str):
-    ranked = hybrid_search(question)
-
-    parent_scores = {}
-
-    for idx, score in ranked:
-        pid = chunk_parent_map.get(idx)
-        if pid is None:
-            continue
-
-        # max pooling (better than sum)
-        parent_scores[pid] = max(parent_scores.get(pid, 0), score)
-
-    top_parents = sorted(parent_scores.items(), key=lambda x: x[1], reverse=True)[:FINAL_K]
-
-    return [parent_map[pid] for pid, _ in top_parents]
-
-# ================= LLM =================
-client = OpenAI(
-    base_url=LLM_BASE_URL,
-    api_key=STUDENT_ID
-)
-
-def clean_answer(text: str) -> str:
-    text = text.strip().upper()
-    for c in ["A", "B", "C", "D"]:
-        if c in text:
-            return c
-    return "A"
-
-
-def ask_llm(question: str, context: str):
-    system = "Bạn là trợ lý trắc nghiệm. Chỉ trả lời A, B, C hoặc D. Không giải thích."
-
-    user = f"""
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-    res = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        max_tokens=5,
-        temperature=0
-    )
-
-    return clean_answer(res.choices[0].message.content)
-
-# ================= FASTAPI =================
-app = FastAPI()
-
+# ── Schemas (đúng slide) ──────────────────────────────────────────────────────
 class UploadRequest(BaseModel):
-    text: str
     doc_id: Optional[str] = None
+    text: str
 
+class UploadResponse(BaseModel):
+    status: str
+    doc_id: Optional[str] = None
+    chunks: int
 
 class AskRequest(BaseModel):
     question: str
 
+class AskResponse(BaseModel):
+    answer: str
+    sources: List[str] = []
 
-@app.post("/upload")
-def upload(req: UploadRequest):
-    build_index(req.text)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+"""def split_sentences(text: str) -> List[str]:
+    # Simple sentence splitter for Vietnamese + English
+    # Handles ., ?, ! and line breaks
+    sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
+    return [s.strip() for s in sentences if s.strip()]
+    
+   def chunk_text(text: str) -> List[str]:
+    sentences = split_sentences(text)
 
-    return {
-        "status": "ok",
-        "chunks": len(chunk_store)
-    }
+    chunks = []
+    current_chunk = []
+    current_length = 0
 
+    step_overlap_sentences = max(1, CHUNK_OVERLAP // 50)  # rough heuristic
 
-@app.post("/ask")
-def ask(req: AskRequest):
-    if not chunk_store:
-        raise HTTPException(400, "No data uploaded")
+    for sent in sentences:
+        sent_len = len(sent)
 
-    context = retrieve(req.question)
-    context_text = "\n\n---\n\n".join(context)
+        # if adding sentence exceeds limit → flush chunk
+        if current_length + sent_len > CHUNK_SIZE and current_chunk:
+            chunks.append(" ".join(current_chunk))
 
-    answer = ask_llm(req.question, context_text)
+            # keep overlap
+            current_chunk = current_chunk[-step_overlap_sentences:]
+            current_length = sum(len(s) for s in current_chunk)
 
-    return {"answer": answer}
+        current_chunk.append(sent)
+        current_length += sent_len
 
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
 
+    return chunks
+    """
+def chunk_text(text: str) -> List[str]:
+    chunks, start = [], 0
+    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+    while start < len(text):
+        chunks.append(text[start : start + CHUNK_SIZE])
+        start += step
+    return chunks
+
+_VALID_LETTERS = {"A", "B", "C", "D"}
+
+def extract_letter(raw: str) -> str:
+    """LLM có thể trả 'A', 'A.', 'Đáp án: B', '**C**'... → chuẩn hoá về 1 ký tự."""
+    if not raw:
+        return "A"
+    s = raw.strip().upper()
+
+    # ký tự đầu nếu hợp lệ
+    if s[0] in _VALID_LETTERS:
+        return s[0]
+
+    # tìm pattern 'ĐÁP ÁN: X' hoặc 'ANSWER: X'
+    m = re.search(r"(?:ĐÁP\s*ÁN|ANSWER|CHỌN)\s*[:\-]?\s*([ABCD])", s)
+    if m:
+        return m.group(1)
+
+    # tìm ký tự A/B/C/D đầu tiên bị bao bởi non-letter
+    m = re.search(r"(?<![A-Z])([ABCD])(?![A-Z])", s)
+    if m:
+        return m.group(1)
+
+    return "A"  # fallback an toàn
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "chunks": len(chunk_store),
-        "model": EMBED_MODEL_PATH
+        "embed": EMBED_MODEL_NAME,
+        "db": "faiss-memory",
+        "indexed": db_count(),
+        "llm_base_url": LLM_BASE_URL,
+        "llm_model": LLM_MODEL,
+        "student_id": STUDENT_ID,
     }
+
+@app.post("/upload", response_model=UploadResponse)
+def upload(req: UploadRequest):
+    # Reset DB mỗi lần nhận document mới để tránh nhiễu giữa các lượt thi
+    db_reset()
+
+    doc_id = req.doc_id if req.doc_id and req.doc_id != "none" else str(uuid.uuid4())[:8]
+    chunks = chunk_text(req.text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Empty document.")
+
+    vectors = get_embeddings(chunks)
+    for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        db_upsert(f"{doc_id}_chunk_{i}", vec, chunk)
+
+    return UploadResponse(status="success", doc_id=doc_id, chunks=len(chunks))
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    if db_count() == 0:
+        raise HTTPException(status_code=400, detail="No documents indexed yet.")
+
+    q_vec = get_embeddings([req.question])[0]
+    hits = db_search(q_vec, TOP_K)
+
+    context_chunks = [h["text"] for h in hits]
+    context = "\n\n---\n\n".join(context_chunks)
+
+    from openai import OpenAI
+    client = OpenAI(base_url=LLM_BASE_URL, api_key=STUDENT_ID)
+
+    system_prompt = (
+        "Bạn là trợ lý trả lời trắc nghiệm. "
+        "Dựa CHỈ vào tài liệu được cung cấp để chọn đáp án đúng. "
+        "BẮT BUỘC chỉ trả lời bằng MỘT ký tự duy nhất: A, B, C hoặc D. "
+        "Không giải thích, không viết gì thêm."
+    )
+
+    user_prompt = f"""Tài liệu tham khảo:
+{context}
+
+Câu hỏi trắc nghiệm:
+{req.question}
+
+Đáp án (chỉ 1 ký tự A/B/C/D):"""
+
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=4,
+        temperature=0.0,
+    )
+    raw = response.choices[0].message.content
+    answer = extract_letter(raw)
+
+    return AskResponse(answer=answer, sources = [h["chunk_id"] for h in hits])
+
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)

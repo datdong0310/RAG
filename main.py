@@ -4,6 +4,9 @@ from typing import Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import re
+from typing import List
+
 
 load_dotenv()
 
@@ -41,32 +44,43 @@ print(f"[embed] local — {EMBED_MODEL_NAME}  dim={EMBED_DIM}")
 # ── Vector store (FAISS in-memory) ───────────────────────────────────────────
 import faiss, numpy as np
 
-_index = faiss.IndexFlatL2(EMBED_DIM)
+_index = faiss.IndexIDMap2(faiss.IndexFlatIP(EMBED_DIM))
 _store: dict[str, str] = {}   # chunk_id -> text
 _id_list: list[str] = []
 
-def db_reset():
-    global _index, _store, _id_list
-    _index = faiss.IndexFlatL2(EMBED_DIM)
-    _store = {}
-    _id_list = []
-
 def db_upsert(chunk_id: str, vector: List[float], text: str):
-    _index.add(np.array([vector], dtype="float32"))
-    _store[chunk_id] = text
+    vec = np.array([vector], dtype="float32")
+    faiss.normalize_L2(vec)
+
+    faiss_id = len(_id_list)  # or hash-based ID
     _id_list.append(chunk_id)
+    _store[chunk_id] = text
+
+    _index.add_with_ids(vec, np.array([faiss_id], dtype=np.int64))
 
 def db_search(vector: List[float], k: int) -> List[dict]:
     if _index.ntotal == 0:
         return []
+
     vec = np.array([vector], dtype="float32")
+    faiss.normalize_L2(vec)  # IMPORTANT
+
     _, idxs = _index.search(vec, min(k, _index.ntotal))
-    return [{"chunk_id": _id_list[i], "text": _store[_id_list[i]]}
-            for i in idxs[0] if i < len(_id_list)]
+
+    return [
+        {"chunk_id": _id_list[i], "text": _store[_id_list[i]]}
+        for i in idxs[0] if i < len(_id_list)
+    ]
 
 def db_count() -> int:
     return _index.ntotal
 
+def db_reset():
+    global _index, _store, _id_list
+    _index = faiss.IndexIDMap2(faiss.IndexFlatIP(EMBED_DIM))
+    _store = {}
+    _id_list = []
+    
 print("[db] FAISS in-memory")
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -90,6 +104,40 @@ class AskResponse(BaseModel):
     sources: List[str] = []
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+"""def split_sentences(text: str) -> List[str]:
+    # Simple sentence splitter for Vietnamese + English
+    # Handles ., ?, ! and line breaks
+    sentences = re.split(r'(?<=[.!?])\s+|\n+', text)
+    return [s.strip() for s in sentences if s.strip()]
+    
+   def chunk_text(text: str) -> List[str]:
+    sentences = split_sentences(text)
+
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    step_overlap_sentences = max(1, CHUNK_OVERLAP // 50)  # rough heuristic
+
+    for sent in sentences:
+        sent_len = len(sent)
+
+        # if adding sentence exceeds limit → flush chunk
+        if current_length + sent_len > CHUNK_SIZE and current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+            # keep overlap
+            current_chunk = current_chunk[-step_overlap_sentences:]
+            current_length = sum(len(s) for s in current_chunk)
+
+        current_chunk.append(sent)
+        current_length += sent_len
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+    """
 def chunk_text(text: str) -> List[str]:
     chunks, start = [], 0
     step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
@@ -192,7 +240,7 @@ Câu hỏi trắc nghiệm:
     raw = response.choices[0].message.content
     answer = extract_letter(raw)
 
-    return AskResponse(answer=answer, sources=context_chunks)
+    return AskResponse(answer=answer, sources = [h["chunk_id"] for h in hits])
 
 
 
