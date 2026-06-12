@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# Models
+models/
+*.safetensors
+
+# VSCode
+.vscode/
+
+# Environment variables
+.env

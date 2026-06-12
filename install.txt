@@ -1,0 +1,2 @@
+pip install fastapi uvicorn numpy faiss-cpu sentence-transformers torch underthesea rank-bm25 openai python-dotenv
+pip install torch --index-url https://download.pytorch.org/whl/cpu
